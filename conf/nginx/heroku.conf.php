@@ -8,6 +8,10 @@ http {
 
     #access_log  logs/access.log  main;
 
+    log_format combinedVHosts '$host - $http_x_forwarded_for - $remote_user [$time_local] "$request" '
+                              '$status $body_bytes_sent "$http_referer" '
+                              '"$http_user_agent" $request_time';
+
     sendfile        on;
     #tcp_nopush     on;
 
@@ -55,7 +59,7 @@ http {
         root "<?=getenv('DOCUMENT_ROOT')?:getenv('HEROKU_APP_DIR')?:getcwd()?>";
         
         error_log stderr;
-        access_log /tmp/heroku.nginx_access.<?=getenv('PORT')?:'8080'?>.log;
+        access_log /tmp/heroku.nginx_access.<?=getenv('PORT')?:'8080'?>.log combinedVHosts;
         
         include "<?=getenv('HEROKU_PHP_NGINX_CONFIG_INCLUDE')?>";
         

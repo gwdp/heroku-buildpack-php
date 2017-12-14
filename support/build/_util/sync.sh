@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 
 set -eu
+set -o pipefail
+
+function s3cmd_get_progress() {
+	len=0
+	while read line; do
+		if [[ "$len" -gt 0 ]]; then
+			# repeat a backspace $len times
+			# need to use seq; {1..$len} doesn't work
+			printf '%0.s\b' $(seq 1 $len)
+		fi
+		echo -n "$line"
+		len=${#line}
+	done < <(grep --line-buffered -o -E '\[[0-9]+ of [0-9]+\]') # filter only the "[1 of 99]" bits from 's3cmd get' output
+}
 
 remove=true
 
@@ -43,7 +57,7 @@ if [[ $# -gt 2 ]]; then
 else
 	dst_region="s3"
 fi
-echo "$@"
+
 src_bucket=${1:-$S3_BUCKET}; shift || true
 src_prefix=${1:-$S3_PREFIX}; shift || true
 if [[ $# == "1" ]]; then
@@ -63,15 +77,16 @@ trap 'rm -rf $src_tmp $dst_tmp;' EXIT
 echo -n "Fetching source's manifests from s3://${src_bucket}/${src_prefix}... " >&2
 (
 	cd $src_tmp
-	out=$(s3cmd --ssl get s3://${src_bucket}/${src_prefix}*.composer.json 2>&1) || { echo -e "failed! Error:\n$out" >&2; exit 1; }
-	ls *.composer.json 2>/dev/null 1>&2 || { echo "failed; no manifests found!" >&2; exit 1; }
 	out=$(s3cmd --ssl get s3://${src_bucket}/${src_prefix}packages.json 2>&1) || { echo -e "No packages.json in source repo:\n$out" >&2; exit 1; }
+	s3cmd --ssl --progress get s3://${src_bucket}/${src_prefix}*.composer.json 2>&1 | tee download.log | s3cmd_get_progress >&2 || { echo -e "failed! Error:\n$(cat download.log)" >&2; exit 1; }
+	ls *.composer.json 2>/dev/null 1>&2 || { echo "failed; no manifests found!" >&2; exit 1; }
+	rm download.log
 )
-echo "done." >&2
+echo "" >&2
 
 # this mkrepo.sh call won't actually download, but use the given *.composer.json, and echo a generated packages.json
 # we use this to compare to the downloaded packages.json
-$here/mkrepo.sh $src_bucket $src_prefix ${src_tmp}/*.composer.json 2>/dev/null | python -c 'import sys, json; sys.exit(abs(cmp(json.load(open(sys.argv[1])), json.load(sys.stdin))))' ${src_tmp}/packages.json || {
+$here/mkrepo.sh $src_bucket $src_prefix ${src_tmp}/*.composer.json 2>/dev/null | python -c 'import sys, json; sys.exit(json.load(open(sys.argv[1])) != json.load(sys.stdin))' ${src_tmp}/packages.json || {
 	echo "WARNING: packages.json from source does not match its list of manifests!" >&2
 	echo " You should run 'mkrepo.sh' to update, or ask the bucket maintainers to do so." >&2
 	read -p "Would you like to abort this operation? [Yn] " proceed
@@ -81,9 +96,10 @@ $here/mkrepo.sh $src_bucket $src_prefix ${src_tmp}/*.composer.json 2>/dev/null |
 echo -n "Fetching destination's manifests from s3://${dst_bucket}/${dst_prefix}... " >&2
 (
 	cd $dst_tmp
-	out=$(s3cmd --ssl get s3://${dst_bucket}/${dst_prefix}*.composer.json 2>&1) || { echo -e "failed! Error:\n$out" >&2; exit 1; }
+	s3cmd --ssl --progress get s3://${dst_bucket}/${dst_prefix}*.composer.json 2>&1 | tee download.log | s3cmd_get_progress >&2 || { echo -e "failed! Error:\n$(cat download.log)" >&2; exit 1; }
+	rm download.log
 )
-echo "done." >&2
+echo "" >&2
 
 comm=$(comm <(cd $src_tmp; ls -1 *.composer.json) <(cd $dst_tmp; ls -1 *.composer.json 2> /dev/null)) # comm produces three columns of output: entries only in left file, entries only in right file, entries in both
 add_manifests=$(echo "$comm" | grep '^\S' || true) # no tabs means output in col 1 = files only in src
@@ -107,12 +123,12 @@ for filename in $common; do
 		# same for times, but we'll look at them
 		try:
 		    src_time = datetime.datetime.strptime(src_manifest.pop("time"), "%Y-%m-%d %H:%M:%S") # UTC
-		except KeyError, ValueError:
+		except (KeyError, ValueError):
 		    src_time = datetime.datetime.utcfromtimestamp(os.path.getmtime(sys.argv[1]))
 		    stderrprint("WARNING: source manifest {} has invalid time entry, using mtime: {}".format(os.path.basename(sys.argv[1]), src_time.isoformat()))
 		try:
 		    dst_time = datetime.datetime.strptime(dst_manifest.pop("time"), "%Y-%m-%d %H:%M:%S") # UTC
-		except KeyError, ValueError:
+		except (KeyError, ValueError):
 		    dst_time = datetime.datetime.utcfromtimestamp(os.path.getmtime(sys.argv[2]))
 		    stderrprint("WARNING: destination manifest {} has invalid time entry, using mtime: {}".format(os.path.basename(sys.argv[2]), dst_time.isoformat()))
 		# a newer source time means we will copy
@@ -124,7 +140,7 @@ for filename in $common; do
 		    # 5 = content identical, src_time < dst_time (probably needs sync the other way)
 		    # 7 = content different, src_time < dst_time (probably needs sync the other way)
 		    ret = 1
-		    ret = ret | abs(cmp(src_manifest, dst_manifest))<<1
+		    ret = ret | (src_manifest != dst_manifest)<<1
 		    ret = ret | (src_time < dst_time)<<2
 		    sys.exit(ret)
 		PYTHON
